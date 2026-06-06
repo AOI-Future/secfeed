@@ -1,0 +1,33 @@
+# Standalone secfeed compose.
+# The service is independent from agent-purple.
+# Network aliases keep existing clients working at either http://secfeed:8888/sse
+# or the legacy http://purple-secfeed:8888/sse name during migration.
+services:
+  secfeed:
+    build: .
+    container_name: secfeed
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1
+    ports:
+      - "100.94.245.115:8889:8888"
+    volumes:
+      - secfeed-data:/data
+    environment:
+      - TZ=Asia/Tokyo
+      - SECFEED_DB_PATH=/data/secfeed.db
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - NVD_API_KEY=${NVD_API_KEY:-}
+    networks:
+      ai_network:
+        aliases:
+          - secfeed
+          - purple-secfeed
+
+volumes:
+  secfeed-data:
+    name: secfeed-data
+
+networks:
+  ai_network:
+    external: true
