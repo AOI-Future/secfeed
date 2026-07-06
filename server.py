@@ -10,6 +10,10 @@ Provides curated security intelligence from authoritative sources:
 - Security news (The Hacker News, BleepingComputer, Krebs, The Record, SANS ISC)
 - CISA Cybersecurity Advisories
 - arXiv cs.CR (AI/ML security research)
+- Agent-security sources (Simon Willison, Embrace The Red)
+
+All items are auto-classified against the agent-security-manual threat taxonomy
+(TH-01..TH-10): https://github.com/AOI-Future/agent-security-manual
 """
 
 import asyncio
@@ -20,6 +24,7 @@ import threading
 
 from fastmcp import FastMCP
 
+import taxonomy
 from fetcher import FeedFetcher, SecurityDB, run_fetch_loop
 
 logging.basicConfig(
@@ -193,12 +198,117 @@ async def get_threat_summary() -> str:
     return _fmt(summary)
 
 
+@mcp.tool()
+async def get_agent_threat_feed(threat_class: str = "all", days: int = 7, limit: int = 20) -> str:
+    """Get intelligence items relevant to AI-agent security, tagged by threat class.
+
+    Every ingested item (CVE, news, threat intel, research) is classified against
+    the agent-security-manual threat taxonomy TH-01..TH-10
+    (https://github.com/AOI-Future/agent-security-manual):
+    TH-01 Prompt injection (direct/indirect) / TH-02 Tool abuse & privilege escalation /
+    TH-03 RAG & knowledge-base poisoning / TH-04 Memory & context contamination /
+    TH-05 Agent identity & authority abuse / TH-06 Delegation & multi-agent abuse /
+    TH-07 Supply-chain, MCP & plugin compromise / TH-08 Data exfiltration & secret exposure /
+    TH-09 Audit & evaluation evasion / TH-10 Model & service abuse.
+
+    Args:
+        threat_class: A TH id ("TH-01".."TH-10") to filter, or "all"
+        days: How many days back to search (default: 7)
+        limit: Maximum results to return (default: 20)
+
+    Returns:
+        JSON with matched items (each tagged with its TH classes) plus the
+        manual's control mapping (CT/REQ/chapters) for the requested threat class.
+    """
+    threat_class = threat_class.strip().upper() if threat_class != "all" else "all"
+    if threat_class != "all" and threat_class not in taxonomy.TH_CLASSES:
+        return _fmt({"error": f"Unknown threat class: {threat_class}. Valid: TH-01..TH-10 or 'all'."})
+    results = db.get_agent_items(threat_class, days, limit)
+    response = {"count": len(results), "results": results}
+    if threat_class != "all":
+        response["taxonomy"] = taxonomy.lookup(threat_class)
+    else:
+        response["manual"] = taxonomy.MANUAL_URL
+    if not results:
+        response["message"] = "No agent-relevant items found for the given criteria."
+    return _fmt(response)
+
+
+@mcp.tool()
+async def lookup_taxonomy(identifier: str = "all") -> str:
+    """Look up the agent-security-manual threat/control taxonomy.
+
+    Resolves a threat class (TH-01..TH-10) to its mitigating controls (CT),
+    requirements (REQ), verification tests (VT) and manual chapters — or a
+    control (CT-01..CT-15) to the threats it answers. Use this to turn a
+    tagged feed item into concrete hardening actions.
+
+    Args:
+        identifier: "TH-XX", "CT-XX", or "all" for the full taxonomy index
+
+    Returns:
+        JSON taxonomy entry with traceability chain and manual references.
+    """
+    identifier = identifier.strip().upper()
+    if identifier in ("ALL", ""):
+        return _fmt({
+            "manual": taxonomy.MANUAL_URL,
+            "threats": {k: v["name"] for k, v in taxonomy.TH_CLASSES.items()},
+            "controls": {k: v["name"] for k, v in taxonomy.CT_CONTROLS.items()},
+        })
+    entry = taxonomy.lookup(identifier)
+    if entry is None:
+        return _fmt({"error": f"Unknown identifier: {identifier}. Use TH-01..TH-10, CT-01..CT-15, or 'all'."})
+    return _fmt(entry)
+
+
+@mcp.tool()
+async def get_agent_security_digest(days: int = 7) -> str:
+    """Get an AI-agent security digest: activity per threat class + top items.
+
+    Aggregates all agent-relevant intelligence over the period, grouped by
+    agent-security-manual threat class (TH-01..TH-10), with the mitigating
+    controls and manual chapters for each active threat. Use this for a
+    periodic agent-security posture review.
+
+    Args:
+        days: Aggregation period in days (default: 7)
+
+    Returns:
+        JSON digest: per-TH item counts, top recent items per active threat,
+        and control/chapter references from the manual.
+    """
+    digest = db.get_agent_digest(days)
+    digest["manual"] = taxonomy.MANUAL_URL
+    threats = {}
+    for th, count in digest.pop("counts_by_threat").items():
+        info = taxonomy.TH_CLASSES.get(th, {})
+        threats[th] = {
+            "name": info.get("name"),
+            "items": count,
+            "top_items": [
+                {"id": i["id"], "title": i["title"], "source": i["source"],
+                 "published_at": i["published_at"], "url": i["url"]}
+                for i in db.get_agent_items(th, days, 3)
+            ],
+            "controls": info.get("controls", []),
+            "chapters": info.get("chapters", []),
+        }
+    digest["threats"] = threats
+    return _fmt(digest)
+
+
 # === Background Feed Fetcher ===
 
 
 def _start_fetch_thread():
     """Run the feed fetch loop in a background daemon thread."""
     def target():
+        try:
+            # Classify pre-existing rows before serving (idempotent, NULL-only)
+            db.backfill_th_classes()
+        except Exception as e:
+            logger.error(f"th_classes backfill failed: {e}")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -221,5 +331,5 @@ if __name__ == "__main__":
         logger.info("Starting secfeed (stdio mode)")
         mcp.run(transport="stdio")
     else:
-        logger.info("Starting secfeed (SSE mode on 0.0.0.0:8888)")
-        mcp.run(transport="sse", host="0.0.0.0", port=8888)
+        logger.info("Starting secfeed (Streamable HTTP mode on 0.0.0.0:8888/mcp)")
+        mcp.run(transport="http", host="0.0.0.0", port=8888)

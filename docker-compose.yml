@@ -1,7 +1,6 @@
 # Standalone secfeed compose.
-# The service is independent from agent-purple.
-# Network aliases keep existing clients working at either http://secfeed:8888/sse
-# or the legacy http://purple-secfeed:8888/sse name during migration.
+# Public access is through https://mcp.aoifuture.com/secfeed/mcp with Bearer auth.
+# No legacy purple aliases or direct SSE endpoint are part of the canonical service.
 services:
   secfeed:
     build: .
@@ -9,8 +8,6 @@ services:
     restart: unless-stopped
     mem_limit: 512m
     cpus: 1
-    ports:
-      - "100.94.245.115:8889:8888"
     volumes:
       - secfeed-data:/data
     environment:
@@ -20,9 +17,6 @@ services:
       - NVD_API_KEY=${NVD_API_KEY:-}
     networks:
       ai_network:
-        aliases:
-          - secfeed
-          - purple-secfeed
 
 volumes:
   secfeed-data:

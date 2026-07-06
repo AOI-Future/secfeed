@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 import feedparser
 import httpx
 
+from taxonomy import classify_th
+
 logger = logging.getLogger("secfeed")
 
 DB_PATH = os.environ.get("SECFEED_DB_PATH", "/data/secfeed.db")
@@ -28,7 +30,10 @@ RSS_FEEDS = {
     "therecord": "https://therecord.media/feed",
     "sans_isc": "https://isc.sans.edu/rssfeed.xml",
     "cisa_advisories": "https://www.cisa.gov/cybersecurity-advisories/all.xml",
-    "arxiv_cs_cr": "http://arxiv.org/rss/cs.CR",
+    "arxiv_cs_cr": "https://rss.arxiv.org/rss/cs.CR",
+    # Agent-security focused sources (LLM/agent threat coverage for TH-01..TH-10)
+    "simonwillison": "https://simonwillison.net/atom/everything/",
+    "embracethered": "https://embracethered.com/blog/index.xml",
 }
 
 # Fetch intervals (seconds)
@@ -124,17 +129,26 @@ class SecurityDB:
             );
         """)
         conn.commit()
+        # Migration: agent-threat classification column (JSON array of TH ids,
+        # NULL = not yet classified, '[]' = classified as not agent-relevant)
+        for table in ("vulnerabilities", "security_news", "threat_intel"):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN th_classes TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.close()
 
     def upsert_vulnerability(self, vuln: dict):
         conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
+        th_classes = json.dumps(classify_th(f"{vuln.get('title') or ''} {vuln.get('description') or ''}"))
         conn.execute("""
             INSERT INTO vulnerabilities
                 (id, source, title, description, severity, cvss_score,
                  epss_score, epss_percentile, affected_packages, references_json,
-                 published_at, updated_at, fetched_at, has_poc, in_cisa_kev)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 published_at, updated_at, fetched_at, has_poc, in_cisa_kev, th_classes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title=COALESCE(excluded.title, title),
                 description=COALESCE(excluded.description, description),
@@ -149,7 +163,9 @@ class SecurityDB:
                 updated_at=excluded.updated_at,
                 fetched_at=excluded.fetched_at,
                 has_poc=MAX(has_poc, excluded.has_poc),
-                in_cisa_kev=MAX(in_cisa_kev, excluded.in_cisa_kev)
+                in_cisa_kev=MAX(in_cisa_kev, excluded.in_cisa_kev),
+                th_classes=CASE WHEN excluded.th_classes != '[]'
+                    THEN excluded.th_classes ELSE COALESCE(th_classes, excluded.th_classes) END
         """, (
             vuln.get("id"), vuln.get("source"), vuln.get("title"),
             vuln.get("description"), vuln.get("severity"),
@@ -159,6 +175,7 @@ class SecurityDB:
             json.dumps(vuln.get("references", [])),
             vuln.get("published_at"), vuln.get("updated_at", now),
             now, vuln.get("has_poc", 0), vuln.get("in_cisa_kev", 0),
+            th_classes,
         ))
         # Update FTS index
         conn.execute("DELETE FROM search_fts WHERE item_id = ?", (vuln["id"],))
@@ -172,17 +189,20 @@ class SecurityDB:
     def upsert_news(self, news: dict):
         conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
+        th_classes = json.dumps(classify_th(f"{news.get('title') or ''} {news.get('summary') or ''}"))
         conn.execute("""
             INSERT INTO security_news
-                (id, source, title, summary, url, author, published_at, fetched_at, categories)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, source, title, summary, url, author, published_at, fetched_at, categories, th_classes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                title=excluded.title, summary=excluded.summary, fetched_at=excluded.fetched_at
+                title=excluded.title, summary=excluded.summary, fetched_at=excluded.fetched_at,
+                th_classes=excluded.th_classes
         """, (
             news["id"], news["source"], news.get("title"),
             news.get("summary"), news.get("url"), news.get("author"),
             news.get("published_at"), now,
             json.dumps(news.get("categories", [])),
+            th_classes,
         ))
         conn.execute("DELETE FROM search_fts WHERE item_id = ?", (news["id"],))
         conn.execute(
@@ -195,19 +215,22 @@ class SecurityDB:
     def upsert_threat(self, threat: dict):
         conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
+        th_classes = json.dumps(classify_th(f"{threat.get('title') or ''} {threat.get('description') or ''}"))
         conn.execute("""
             INSERT INTO threat_intel
-                (id, source, type, title, description, indicators, tags, published_at, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, source, type, title, description, indicators, tags, published_at, fetched_at, th_classes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, description=excluded.description,
-                indicators=excluded.indicators, fetched_at=excluded.fetched_at
+                indicators=excluded.indicators, fetched_at=excluded.fetched_at,
+                th_classes=excluded.th_classes
         """, (
             threat["id"], threat["source"], threat.get("type"),
             threat.get("title"), threat.get("description"),
             json.dumps(threat.get("indicators", {})),
             json.dumps(threat.get("tags", [])),
             threat.get("published_at"), now,
+            th_classes,
         ))
         conn.execute("DELETE FROM search_fts WHERE item_id = ?", (threat["id"],))
         conn.execute(
@@ -231,6 +254,42 @@ class SecurityDB:
         """, (source, now, now if success else None, count, error, success, success))
         conn.commit()
         conn.close()
+
+    def backfill_th_classes(self, batch_size: int = 2000) -> int:
+        """Classify rows ingested before the th_classes column existed.
+
+        Idempotent: only touches rows where th_classes IS NULL. Safe to run at
+        every startup.
+        """
+        specs = [
+            ("vulnerabilities", "description"),
+            ("security_news", "summary"),
+            ("threat_intel", "description"),
+        ]
+        total = 0
+        conn = self._get_conn()
+        for table, body_col in specs:
+            while True:
+                rows = conn.execute(
+                    f"SELECT id, title, {body_col} AS body FROM {table} "
+                    "WHERE th_classes IS NULL LIMIT ?",
+                    (batch_size,),
+                ).fetchall()
+                if not rows:
+                    break
+                updates = [
+                    (json.dumps(classify_th(f"{r['title'] or ''} {r['body'] or ''}")), r["id"])
+                    for r in rows
+                ]
+                conn.executemany(
+                    f"UPDATE {table} SET th_classes = ? WHERE id = ?", updates
+                )
+                conn.commit()
+                total += len(rows)
+        conn.close()
+        if total:
+            logger.info(f"th_classes backfill: {total} rows classified")
+        return total
 
     # === Query Methods ===
 
@@ -406,6 +465,78 @@ class SecurityDB:
             "threat_indicators_24h": threat_count,
             "recent_ai_security_research": [dict(r) for r in recent_research],
             "feed_health": [dict(r) for r in feed_status],
+        }
+
+    # === Agent-Threat Query Methods (agent-security-manual taxonomy) ===
+
+    def get_agent_items(self, threat_class: str = "all", days: int = 7,
+                        limit: int = 20) -> list[dict]:
+        """Items classified under one or more TH-XX agent threat classes.
+
+        threat_class: "all" or a specific TH id (e.g. "TH-01").
+        """
+        conn = self._get_conn()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        th_filter = ""
+        extra_params: list = []
+        if threat_class != "all":
+            # th_classes is a JSON array like ["TH-01","TH-04"]
+            th_filter = " AND th_classes LIKE ?"
+            extra_params.append(f'%"{threat_class.upper()}"%')
+
+        specs = [
+            ("vulnerabilities", "vulnerability", "description",
+             "'https://nvd.nist.gov/vuln/detail/' || id"),
+            ("security_news", "news", "summary", "url"),
+            ("threat_intel", "threat_intel", "description", "NULL"),
+        ]
+        items: list[dict] = []
+        for table, item_type, body_col, url_expr in specs:
+            rows = conn.execute(f"""
+                SELECT id, source, title,
+                       substr({body_col}, 1, 500) AS summary,
+                       {url_expr} AS url,
+                       published_at, th_classes,
+                       '{item_type}' AS item_type
+                FROM {table}
+                WHERE th_classes IS NOT NULL AND th_classes != '[]'
+                  AND published_at >= ?{th_filter}
+            """, [cutoff, *extra_params]).fetchall()
+            items.extend(dict(r) for r in rows)
+        conn.close()
+
+        for item in items:
+            try:
+                item["th_classes"] = json.loads(item["th_classes"])
+            except (json.JSONDecodeError, TypeError):
+                item["th_classes"] = []
+        items.sort(key=lambda i: i["published_at"] or "", reverse=True)
+        return items[:limit]
+
+    def get_agent_digest(self, days: int = 7) -> dict:
+        """Aggregate agent-threat activity: per-TH counts + most recent items."""
+        conn = self._get_conn()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        counts: dict[str, int] = {}
+        total = 0
+        for table in ("vulnerabilities", "security_news", "threat_intel"):
+            rows = conn.execute(f"""
+                SELECT th_classes FROM {table}
+                WHERE th_classes IS NOT NULL AND th_classes != '[]'
+                  AND published_at >= ?
+            """, (cutoff,)).fetchall()
+            for r in rows:
+                total += 1
+                try:
+                    for th in json.loads(r["th_classes"]):
+                        counts[th] = counts.get(th, 0) + 1
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        conn.close()
+        return {
+            "period_days": days,
+            "total_agent_relevant_items": total,
+            "counts_by_threat": dict(sorted(counts.items())),
         }
 
 
