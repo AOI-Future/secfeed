@@ -552,6 +552,7 @@ class FeedFetcher:
         )
         self._nvd_api_key = os.environ.get("NVD_API_KEY")
         self._gh_token = os.environ.get("GITHUB_TOKEN")
+        self._threatfox_auth_key = os.environ.get("THREATFOX_AUTH_KEY")
 
     async def close(self):
         await self.client.aclose()
@@ -916,43 +917,94 @@ class FeedFetcher:
     # === Abuse.ch ThreatFox ===
 
     async def fetch_threatfox(self):
-        url = "https://threatfox-api.abuse.ch/api/v1/"
+        """Fetch recent ThreatFox IoCs.
+
+        ThreatFox changed the community API to require an Auth-Key. When a
+        THREATFOX_AUTH_KEY is configured we use the API endpoint; otherwise, or
+        if the API key is rejected, fall back to the public recent JSON export so
+        the feed remains useful without treating HTTP 401 as a hard failure.
+        """
+        api_url = "https://threatfox-api.abuse.ch/api/v1/"
+        export_url = "https://threatfox.abuse.ch/export/json/recent/"
+
+        def normalize_tags(raw_tags):
+            if isinstance(raw_tags, list):
+                return [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+            if isinstance(raw_tags, str):
+                return [tag.strip() for tag in raw_tags.replace("|", ",").split(",") if tag.strip()]
+            return []
+
+        def upsert_ioc(ioc_id: str, ioc: dict) -> None:
+            value = ioc.get("ioc") or ioc.get("ioc_value") or ""
+            ioc_type = ioc.get("ioc_type", "")
+            threat_type = ioc.get("threat_type_desc") or ioc.get("threat_type", "")
+            self.db.upsert_threat({
+                "id": f"threatfox-{ioc_id}",
+                "source": "threatfox",
+                "type": "ioc",
+                "title": f"{ioc_type}: {value}",
+                "description": (
+                    f"Malware: {ioc.get('malware_printable') or ioc.get('malware') or 'Unknown'}. "
+                    f"Threat: {threat_type}. "
+                    f"Confidence: {ioc.get('confidence_level', '')}%"
+                ),
+                "indicators": {
+                    "type": ioc_type,
+                    "value": value,
+                    "malware": ioc.get("malware_printable") or ioc.get("malware") or "",
+                    "threat_type": ioc.get("threat_type", ""),
+                    "reference": ioc.get("reference", ""),
+                },
+                "tags": normalize_tags(ioc.get("tags")),
+                "published_at": ioc.get("first_seen_utc", ""),
+            })
+
         try:
-            resp = await self.client.post(
-                url,
-                json={"query": "get_iocs", "days": 1},
-                headers={"Content-Type": "application/json"},
-            )
-            if resp.status_code != 200:
-                logger.warning(f"ThreatFox returned {resp.status_code}, skipping")
-                self.db.update_feed_status("threatfox", False, error=f"HTTP {resp.status_code}")
-                return
-            data = resp.json()
+            data = None
+            if self._threatfox_auth_key:
+                resp = await self.client.post(
+                    api_url,
+                    json={"query": "get_iocs", "days": 1},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Auth-Key": self._threatfox_auth_key,
+                    },
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    if payload.get("query_status") == "ok":
+                        data = list(payload.get("data") or [])
+                    else:
+                        logger.warning(
+                            "ThreatFox API returned query_status=%s; falling back to export",
+                            payload.get("query_status"),
+                        )
+                else:
+                    logger.warning("ThreatFox API returned %s; falling back to export", resp.status_code)
+
+            if data is None:
+                resp = await self.client.get(export_url, headers={"Accept": "application/json"})
+                if resp.status_code != 200:
+                    logger.warning(f"ThreatFox export returned {resp.status_code}, skipping")
+                    self.db.update_feed_status("threatfox", False, error=f"HTTP {resp.status_code}")
+                    return
+                export_data = resp.json()
+                data = []
+                for export_id, entries in export_data.items():
+                    for ioc in entries or []:
+                        row = dict(ioc)
+                        row.setdefault("id", export_id)
+                        data.append(row)
+                        if len(data) >= 100:
+                            break
+                    if len(data) >= 100:
+                        break
 
             count = 0
-            if data.get("query_status") == "ok":
-                for ioc in (data.get("data") or [])[:100]:
-                    ioc_id = str(ioc.get("id", ""))
-                    self.db.upsert_threat({
-                        "id": f"threatfox-{ioc_id}",
-                        "source": "threatfox",
-                        "type": "ioc",
-                        "title": f"{ioc.get('ioc_type', '')}: {ioc.get('ioc', '')}",
-                        "description": (
-                            f"Malware: {ioc.get('malware_printable', 'Unknown')}. "
-                            f"Threat: {ioc.get('threat_type_desc', '')}. "
-                            f"Confidence: {ioc.get('confidence_level', '')}%"
-                        ),
-                        "indicators": {
-                            "type": ioc.get("ioc_type", ""),
-                            "value": ioc.get("ioc", ""),
-                            "malware": ioc.get("malware_printable", ""),
-                            "threat_type": ioc.get("threat_type", ""),
-                        },
-                        "tags": ioc.get("tags") or [],
-                        "published_at": ioc.get("first_seen_utc", ""),
-                    })
-                    count += 1
+            for ioc in data[:100]:
+                ioc_id = str(ioc.get("id") or hashlib.sha256(str(ioc).encode()).hexdigest()[:16])
+                upsert_ioc(ioc_id, ioc)
+                count += 1
 
             self.db.update_feed_status("threatfox", True, count)
             logger.info(f"ThreatFox: {count} IoCs indexed")
