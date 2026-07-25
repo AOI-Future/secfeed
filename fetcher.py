@@ -408,10 +408,20 @@ class SecurityDB:
             (day_ago,),
         ).fetchone()[0]
 
-        new_kev = conn.execute(
-            "SELECT COUNT(*) FROM vulnerabilities WHERE in_cisa_kev = 1 AND fetched_at >= ?",
-            (day_ago,),
+        # CISA republishes the complete KEV catalog on every fetch, so
+        # fetched_at measures cache refresh time, not catalog addition time.
+        # dateAdded is stored in published_at and is the authoritative field
+        # for identifying newly added KEV entries.
+        cisa_kev_total = conn.execute(
+            "SELECT COUNT(*) FROM vulnerabilities WHERE in_cisa_kev = 1"
         ).fetchone()[0]
+        new_kev_rows = conn.execute("""
+            SELECT id, title, published_at AS date_added
+            FROM vulnerabilities
+            WHERE in_cisa_kev = 1 AND published_at >= ?
+            ORDER BY published_at DESC, id ASC
+        """, (day_ago,)).fetchall()
+        new_kev = len(new_kev_rows)
 
         high_epss = conn.execute("""
             SELECT id, title, severity, cvss_score, epss_score, has_poc, in_cisa_kev
@@ -457,7 +467,9 @@ class SecurityDB:
             "period": "24h",
             "generated_at": now.isoformat(),
             "critical_high_cves_24h": critical_cves,
+            "cisa_kev_total": cisa_kev_total,
             "new_cisa_kev_24h": new_kev,
+            "new_cisa_kev_items": [dict(r) for r in new_kev_rows],
             "high_epss_vulns": [dict(r) for r in high_epss],
             "recent_pocs": [dict(r) for r in recent_pocs],
             "news_articles_24h": news_count,

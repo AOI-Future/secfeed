@@ -184,7 +184,8 @@ async def get_threat_summary() -> str:
 
     Returns an intelligence briefing including:
     - Critical/High CVE count (24h)
-    - New CISA KEV additions (24h)
+    - Total CISA KEV catalog size
+    - New CISA KEV additions (24h), including CVE id, title, and date added
     - Top 5 highest-EPSS vulnerabilities (7d, actively exploitable)
     - CVEs with confirmed PoC exploits (24h)
     - Top security news headlines (24h)
