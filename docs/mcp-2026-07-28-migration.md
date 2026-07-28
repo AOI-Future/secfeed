@@ -10,6 +10,8 @@ Secfeed remains on the existing Streamable HTTP implementation while retaining t
 
 `requirements.txt` intentionally constrains FastMCP to `<4.0.0`. This prevents an unrelated image rebuild from silently crossing the protocol boundary before an end-to-end migration has been proven.
 
+The currently installed Hermes client is also a hard compatibility gate: its MCP transport still calls `session.initialize()`. A Secfeed-only migration must not be deployed until the Hermes MCP client and its Python SDK can make 2026-07-28 stateless calls (including the required routing headers). Otherwise, Secfeed would be upgraded beyond its active client.
+
 ## Why this is needed
 
 MCP 2026-07-28 removes the `initialize`/`initialized` exchange and `Mcp-Session-Id`; requests are self-describing and use `MCP-Protocol-Version`, `Mcp-Method`, and, for named calls, `Mcp-Name`. It adds `server/discover`, MRTR, cache hints, and authorization changes. The MCP announcement identifies FastMCP 4.0 as the matching implementation line.
@@ -20,12 +22,13 @@ The current server contains no sampling, elicitation, roots, or session-coupled 
 
 Do not change the upper bound or deploy until all of the following pass in an isolated environment, then in the authenticated production canary:
 
-1. Build the exact FastMCP 4 release selected for deployment; record its immutable version and artifact digest.
-2. Send `server/discover` and `tools/list` with `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method`; both succeed without `Mcp-Session-Id`.
-3. Call representative read-only tools (`get_threat_summary`, `search_security`) with the required routing headers, and verify responses have no legacy session dependency.
-4. Verify the gateway forwards `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name`, while unauthenticated and invalid-token requests still return `401`.
-5. Re-run discovery with the Hermes client and verify all nine Secfeed tools; verify feed health and data volume survive the container replacement.
-6. Capture an exact deployment receipt (image digest, timestamp, client discovery result) and keep rollback available by restoring the previous image digest.
+1. Upgrade Hermes's MCP client and its Python MCP SDK to a version that demonstrates a successful 2026-07-28 stateless `server/discover` / `tools/list` exchange. Record its exact version; do not treat an old `session.initialize()` path as compatible.
+2. Build the exact FastMCP 4 release selected for deployment; record its immutable version and artifact digest.
+3. Send `server/discover` and `tools/list` with `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method`; both succeed without `Mcp-Session-Id`.
+4. Call representative read-only tools (`get_threat_summary`, `search_security`) with the required routing headers, and verify responses have no legacy session dependency.
+5. Verify the gateway forwards `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name`, while unauthenticated and invalid-token requests still return `401`.
+6. Re-run discovery with the updated Hermes client and verify all nine Secfeed tools; verify feed health and data volume survive the container replacement.
+7. Capture an exact deployment receipt (image digest, timestamp, client discovery result) and keep rollback available by restoring the previous image digest.
 
 ## Scope exclusions
 
