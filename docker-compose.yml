@@ -1,6 +1,4 @@
-# Standalone secfeed compose.
-# Public access is through https://mcp.aoifuture.com/secfeed/mcp with Bearer auth.
-# No legacy purple aliases or direct SSE endpoint are part of the canonical service.
+# Deployment contract: README.md § Deployment; MCP/FastMCP gate: docs/mcp-2026-07-28-migration.md
 services:
   secfeed:
     build: .
