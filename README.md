@@ -55,12 +55,24 @@ reproducible and auditable.
 
 ## Deployment
 
+The default `docker-compose.yml` attaches secfeed only to the external Docker
+network `ai_network` and does **not** publish host `ports`. Production traffic
+reaches the container on port 8888 from nginx or another service on that
+network (for example `https://mcp.aoifuture.com/secfeed/mcp` with Bearer auth).
+
+Create the network once if it does not exist yet:
+
 ```bash
+docker network create ai_network
 docker compose up -d --build
 docker logs --tail 80 secfeed
 ```
 
-- Streamable HTTP: `http://<host>:8888/mcp` (put a reverse proxy with auth in front for public exposure)
+For local HTTP access from the host, add a `ports` mapping (not in the default
+file), for example `"127.0.0.1:8888:8888"`, then use
+`http://127.0.0.1:8888/mcp`.
+
+- Streamable HTTP (in-container): `http://<host>:8888/mcp` — use a reverse proxy with auth for any public exposure
 - stdio mode: `python3 server.py --stdio`
 - Data volume: `secfeed-data` mounted at `/data` (SQLite + FTS5)
 
@@ -70,6 +82,7 @@ docker logs --tail 80 secfeed
 |---|---|
 | `NVD_API_KEY` | Optional — higher NVD API rate limits |
 | `GITHUB_TOKEN` | Optional — higher GitHub API rate limits |
+| `THREATFOX_AUTH_KEY` | Optional — Abuse.ch ThreatFox API auth (fetcher uses the public feed when unset) |
 | `SECFEED_DB_PATH` | DB path override (default `/data/secfeed.db`) |
 
 Secrets are injected via the compose `environment` block from the host
@@ -80,7 +93,12 @@ environment — never commit them.
 ```bash
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 SECFEED_DB_PATH=/tmp/secfeed-dev.db venv/bin/python3 server.py --stdio
+python3 -m unittest test_fetcher.py
 ```
+
+FastMCP is pinned to `<4.0.0` in `requirements.txt` until MCP 2026-07-28
+migration is proven end-to-end; see
+[docs/mcp-2026-07-28-migration.md](docs/mcp-2026-07-28-migration.md).
 
 ## License
 
