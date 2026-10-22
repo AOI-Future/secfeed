@@ -131,7 +131,7 @@ async def search_security(query: str, limit: int = 20) -> str:
 
 
 @mcp.tool()
-async def get_cve_detail(cve_id: str) -> str:
+async def get_cve_detail(cve_id: str, refresh: bool = False) -> str:
     """Get comprehensive detail for a specific CVE from authoritative sources.
 
     Looks up a CVE by ID (e.g., "CVE-2024-3400") and returns enriched data from
@@ -140,6 +140,7 @@ async def get_cve_detail(cve_id: str) -> str:
 
     Args:
         cve_id: The CVE identifier (e.g., "CVE-2024-3400")
+        refresh: When True, bypass the local cache and re-fetch from NVD/EPSS
 
     Returns:
         JSON object with: description, severity, CVSS score/vector, EPSS score,
@@ -148,10 +149,11 @@ async def get_cve_detail(cve_id: str) -> str:
     """
     cve_id = cve_id.strip().upper()
 
-    # Check local cache first
     cached = db.get_cve_detail(cve_id)
+    if cached and not refresh:
+        return _fmt(cached)
 
-    # On-demand fetch from NVD + EPSS
+    # On-demand fetch from NVD + EPSS (cache miss or explicit refresh)
     fresh = await fetcher.fetch_cve_detail(cve_id)
 
     if not fresh and not cached:
