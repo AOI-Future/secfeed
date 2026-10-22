@@ -118,7 +118,9 @@ async def search_security(query: str, limit: int = 20) -> str:
     (IoCs, CISA advisories), and AI/ML security research (arXiv cs.CR).
 
     Args:
-        query: Search query (supports AND, OR, NOT operators)
+        query: Space-separated terms; each term is matched literally (e.g. CVE-2024-3400).
+            Multiple terms must all appear (implicit AND). FTS5 AND/OR/NOT syntax is not
+            supported — operators are treated as ordinary words.
         limit: Maximum results to return (default: 20)
 
     Returns:
@@ -322,7 +324,6 @@ def _start_fetch_thread():
     t = threading.Thread(target=target, daemon=True, name="secfeed-fetcher")
     t.start()
     logger.info("Background feed fetcher started")
-    return t
 
 
 # === Entry Point ===

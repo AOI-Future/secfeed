@@ -334,10 +334,12 @@ class SecurityDB:
 
     @staticmethod
     def _sanitize_fts_query(query: str) -> str:
-        """Sanitize user query for FTS5 MATCH syntax.
+        """Build an FTS5 MATCH string from user input.
 
-        Wraps each token in double quotes to treat special chars
-        (hyphens in CVE-2024-xxxx, dots, etc.) as literals.
+        Each whitespace-separated token is wrapped in double quotes so hyphens,
+        dots, and other FTS metacharacters match literally (CVE IDs, domains, etc.).
+        Quoted tokens are combined with implicit AND; boolean operators in the
+        input are not interpreted.
         """
         tokens = query.split()
         if not tokens:
@@ -559,7 +561,7 @@ class FeedFetcher:
         self.db = db
         self.client = httpx.AsyncClient(
             timeout=30.0,
-            headers={"User-Agent": "PurpleSecFeed/1.0 (Security Intelligence Aggregator)"},
+            headers={"User-Agent": "SecFeed/1.0 (Security Intelligence Aggregator)"},
             follow_redirects=True,
         )
         self._nvd_api_key = os.environ.get("NVD_API_KEY")
@@ -1027,7 +1029,6 @@ class FeedFetcher:
     # === RSS Feeds (all sources) ===
 
     async def fetch_rss_feeds(self):
-        total = 0
         for source, url in RSS_FEEDS.items():
             try:
                 resp = await self.client.get(url)
@@ -1083,13 +1084,10 @@ class FeedFetcher:
                     count += 1
 
                 self.db.update_feed_status(source, True, count)
-                total += count
                 logger.info(f"RSS {source}: {count} items")
             except Exception as e:
                 self.db.update_feed_status(source, False, error=str(e))
                 logger.error(f"RSS {source} failed: {e}")
-
-        return total
 
 
 async def run_fetch_loop(fetcher: FeedFetcher):
