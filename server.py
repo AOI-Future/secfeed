@@ -118,7 +118,9 @@ async def search_security(query: str, limit: int = 20) -> str:
     (IoCs, CISA advisories), and AI/ML security research (arXiv cs.CR).
 
     Args:
-        query: Search query (supports AND, OR, NOT operators)
+        query: Space-separated terms; each term is matched literally (e.g. CVE-2024-3400).
+            Multiple terms must all appear (implicit AND). FTS5 AND/OR/NOT syntax is not
+            supported — operators are treated as ordinary words.
         limit: Maximum results to return (default: 20)
 
     Returns:
@@ -131,7 +133,7 @@ async def search_security(query: str, limit: int = 20) -> str:
 
 
 @mcp.tool()
-async def get_cve_detail(cve_id: str) -> str:
+async def get_cve_detail(cve_id: str, refresh: bool = False) -> str:
     """Get comprehensive detail for a specific CVE from authoritative sources.
 
     Looks up a CVE by ID (e.g., "CVE-2024-3400") and returns enriched data from
@@ -140,6 +142,7 @@ async def get_cve_detail(cve_id: str) -> str:
 
     Args:
         cve_id: The CVE identifier (e.g., "CVE-2024-3400")
+        refresh: When True, bypass the local cache and re-fetch from NVD/EPSS
 
     Returns:
         JSON object with: description, severity, CVSS score/vector, EPSS score,
@@ -148,10 +151,11 @@ async def get_cve_detail(cve_id: str) -> str:
     """
     cve_id = cve_id.strip().upper()
 
-    # Check local cache first
     cached = db.get_cve_detail(cve_id)
+    if cached and not refresh:
+        return _fmt(cached)
 
-    # On-demand fetch from NVD + EPSS
+    # On-demand fetch from NVD + EPSS (cache miss or explicit refresh)
     fresh = await fetcher.fetch_cve_detail(cve_id)
 
     if not fresh and not cached:
@@ -320,7 +324,6 @@ def _start_fetch_thread():
     t = threading.Thread(target=target, daemon=True, name="secfeed-fetcher")
     t.start()
     logger.info("Background feed fetcher started")
-    return t
 
 
 # === Entry Point ===
